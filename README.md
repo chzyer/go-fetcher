@@ -12,7 +12,7 @@ demo
 =========
 get:
 
-`{go}
+```{go}
 import "fetcher"
 func main() {
     f, err := fetcher.NewFetcher("golang.org")
@@ -24,11 +24,11 @@ func main() {
     println("status:", resp.StatusCode)
     println("body:", string(body))
 }
-`
+```
 
 post:
 
-`{go}
+```{go}
 import "fetcher"
 func main() {
     f, err := NewFetcher("alibench.com")
@@ -44,4 +44,4 @@ func main() {
     if err != nil { return }
     println(string(body))
 }
-`
+```
