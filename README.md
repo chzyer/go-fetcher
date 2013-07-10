@@ -31,7 +31,7 @@ post:
 ```{go}
 import "fetcher"
 func main() {
-    f, err := NewFetcher("alibench.com")
+    f, err := fetcher.NewFetcher("alibench.com")
     if err != nil { return }
 	
     f.Get("/") // create session
