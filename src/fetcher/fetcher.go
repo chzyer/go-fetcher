@@ -3,7 +3,7 @@ package fetcher
 import (
 	"io"
 	"os"
-	"log"
+	"time"
 	"errors"
 	"strings"
 	"net/url"
@@ -11,7 +11,14 @@ import (
 	"io/ioutil"
 	"crypto/tls"
 	"encoding/json"
+	"encoding/base64"
 )
+
+type CacheResponse struct {
+	Resp *http.Response
+	Body []byte
+	CacheTime int64
+}
 
 type Transport struct {
 	tr http.RoundTripper
@@ -35,27 +42,29 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 }
 
 type Fetcher struct {
-	https bool
-	Host string
-	referer string
-	Client *http.Client
-	Cookies []*http.Cookie
+	Https     bool
+	Host      string
+	Referer   string
+	CacheTime int64
+	Cookies   []*http.Cookie
+	Client    *http.Client              `json:"-"`
+	Cache     map[string] CacheResponse `json:"-"`
 }
 
-func NewFetcher(host string) (f *Fetcher, err error) {
+func NewFetcher(host string) (f *Fetcher) {
 	f = newFetcher(nil)
 	f.Host = host
 	return
 }
 
-func NewFetcherHttps(host string) (f *Fetcher, err error) {
+func NewFetcherHttps(host string) (f *Fetcher) {
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{RootCAs: nil, InsecureSkipVerify: true},
 		DisableCompression: true,
 	}
 	f = newFetcher(tr)
 	f.Host = host
-	f.https = true
+	f.Https = true
 	return
 }
 
@@ -64,7 +73,7 @@ func newFetcher(tr http.RoundTripper) (f *Fetcher) {
 	newTr := NewTransport(tr)
 	newTr.AfterReq = func(resp *http.Response, req *http.Request) {
 		f.mergeCookie(resp)
-		f.referer = req.URL.String()
+		f.Referer = req.URL.String()
 	}
 	newTr.BeforeReq = func(req *http.Request) {
 		f.makeOtherHeader(req)
@@ -74,6 +83,18 @@ func newFetcher(tr http.RoundTripper) (f *Fetcher) {
 	f.Client = &http.Client{
 		Transport: newTr,
 	}
+	f.Cache = make(map[string] CacheResponse)
+	return
+}
+
+func (f *Fetcher) GetBase64(path string) (data string, err error) {
+	resp, body, err := f.Get(path)
+	if err != nil { return }
+	if resp.StatusCode / 100 != 2 {
+		err = errors.New(err.Error())
+		return
+	}
+	data = base64.StdEncoding.EncodeToString(body)
 	return
 }
 
@@ -84,12 +105,42 @@ func (f *Fetcher) SaveFile(path, dstPath string) (err error) {
 	return
 }
 
+func (f *Fetcher) RemoveGetCache(path string) {
+	key := "get-" + "http"
+	if f.Https { key += "s" }
+	key += "://" + f.Host + path
+	_, ok := f.Cache[key]
+	if ! ok { return }
+	delete(f.Cache, key)
+}
+
+func (f *Fetcher) RemovePostCache(path string, params url.Values) {
+	key := "post-" + path + params.Encode()
+	delete(f.Cache, key)
+}
+
 func (f *Fetcher) Get(path string) (resp *http.Response, body []byte, err error) {
 	path = f.makeUrl(path)
 	req, err := http.NewRequest("GET", path, nil)
 	if err != nil { return }
+
+	key := "get-" + path
+	resp, body, ok := f.loadCache(key)
+	if ok { return }
 	resp, body, err = f.request(req)
 	if err != nil { return }
+	if f.CacheTime > 0 { f.saveCache(key, resp, body) }
+	return
+}
+
+func (f *Fetcher) GetWithNoCache(path string) (resp *http.Response, body []byte, err error) {
+	path = f.makeUrl(path)
+	req, err := http.NewRequest("GET", path, nil)
+	if err != nil { return }
+	key := "get-" + path
+	resp, body, err = f.request(req)
+	if err != nil { return }
+	if f.CacheTime > 0 { f.saveCache(key, resp, body) }
 	return
 }
 
@@ -102,7 +153,7 @@ func (f *Fetcher) Post(
 	req.Header.Set("Content-Type", contentType)
 	resp, body, err = f.request(req)
 	if err != nil { return }
-	f.referer = path
+	f.Referer = path
 	return
 }
 
@@ -111,7 +162,13 @@ func (f *Fetcher) PostForm(path string, val url.Values) (resp *http.Response, bo
 	if val == nil {
 		val = url.Values{}
 	}
+	// key := "post-" + path + val.Encode()
+	// resp, body, ok := f.loadCache(key)
+	// if ok { return }
 	resp, body, err = f.Post(path, contentType, strings.NewReader(val.Encode()))
+	// if f.CacheTime > 0 {
+		// f.saveCache(key, resp, body)
+	// }
 	return
 }
 
@@ -136,8 +193,33 @@ func (f *Fetcher) CallPostForm(v interface{}, path string, val url.Values) (err 
 	return
 }
 
+func (f *Fetcher) getCacheKey(req *http.Request) string {
+	q := req.URL.Query()
+	key := req.URL.Path + q.Encode()
+	return key
+}
+
+func (f *Fetcher) loadCache(key string) (resp *http.Response, body []byte, ok bool) {
+	r, ok := f.Cache[key]
+	if ! ok { return }
+	ok = false
+	if time.Now().Unix() - r.CacheTime > f.CacheTime {
+		delete(f.Cache, key)
+		return
+	}
+	resp, body = r.Resp, r.Body
+	ok = true
+	return
+}
+
+func (f *Fetcher) saveCache(key string, resp *http.Response, body []byte) {
+	r := CacheResponse{
+		resp, body, time.Now().Unix(),
+	}
+	f.Cache[key] = r
+}
+
 func (f *Fetcher) request(req *http.Request) (resp *http.Response, body []byte, err error) {
-	log.Println(req.Method, req.URL, req.Header.Get("Cookie"))
 	resp, err = f.Client.Do(req)
 	if err != nil { return }
 	defer resp.Body.Close()
@@ -146,8 +228,8 @@ func (f *Fetcher) request(req *http.Request) (resp *http.Response, body []byte, 
 }
 
 func (f *Fetcher) insertReferer(req *http.Request) (err error) {
-	if f.referer != "" {
-		req.Header.Set("Referer", f.referer)
+	if f.Referer != "" {
+		req.Header.Set("Referer", f.Referer)
 	}
 	return
 }
@@ -175,7 +257,7 @@ func (f *Fetcher) mergeCookie(resp *http.Response) (err error) {
 next:
 		continue
 	}
-	
+
 	f.Cookies = append(f.Cookies, newCookies[:length]...)
 	return
 }
@@ -188,7 +270,7 @@ func (f *Fetcher) makeUrl(path string) string {
 	}
 	if idx <= 0 {
 		prefix := "http"
-		if f.https { prefix = "https" }
+		if f.Https { prefix = "https" }
 		u = prefix + "://" + u
 	}
 	return u
@@ -198,7 +280,9 @@ func (f *Fetcher) makeOtherHeader(req *http.Request) (err error) {
 	accept := "application/json, text/javascript, */*; q=0.01"
 	origin := f.makeUrl("")
 	requestWith := "XMLHttpRequest"
-	agent := "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_8_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/27.0.1453.116 Safari/537.36"
+	agent := "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_8_3) "
+	agent += "AppleWebKit/537.36 (KHTML, like Gecko) "
+	agent += "Chrome/27.0.1453.116 Safari/537.36"
 	// encoding := "deflate,sdch"
 	encoding := "none"
 	language := "en-US,en;q=0.8"
@@ -208,5 +292,20 @@ func (f *Fetcher) makeOtherHeader(req *http.Request) (err error) {
 	req.Header.Set("User-Agent", agent)
 	req.Header.Set("Accept-Encoding", encoding)
 	req.Header.Set("Accept-Language", language)
+	return
+}
+
+func (f *Fetcher) Store() (ret string, err error) {
+	data, err := json.Marshal(f)
+	if err != nil { return }
+	ret = base64.StdEncoding.EncodeToString(data)
+	return
+}
+
+func Restore(str string) (f *Fetcher, err error) {
+	data, err := base64.StdEncoding.DecodeString(str)
+	if err != nil { return }
+	f = newFetcher(nil)
+	err = json.Unmarshal(data, f)
 	return
 }
